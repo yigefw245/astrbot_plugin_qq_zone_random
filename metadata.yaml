@@ -1,6 +1,6 @@
 name: astrbot_plugin_qq_zone_random
 display_name: QQ空间动态发送
-desc: 通过 OneBot 协议管理 QQ 空间说说，支持发布/查看动态、Cookie 自动绑定。
+desc: HTTP直连QQ空间API，支持Cookie绑定、AI生成说说、时间范围内随机发送。
 version: v1.0.0
-author: AstrBot Community
-repo: https://github.com/AstrBotDevs/astrbot_plugin_qq_zone_random
+author: yigefw245
+repo: https://github.com/yigefw245/astrbot_plugin_qq_zone_random

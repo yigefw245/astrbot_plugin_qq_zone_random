@@ -6,8 +6,11 @@ QQ空间动态发送插件
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import random
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -62,11 +65,10 @@ def _detect_onebot_platform(obj: Any) -> bool:
 @register("astrbot_plugin_qq_zone_random", "AstrBot Community",
           "QQ空间动态发送插件，HTTP直连QQ空间Web API。", "1.0.0")
 class QQZoneRandomPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
         self._context = context
-        raw_config = getattr(context, "get_config", lambda: {})()
-        self.config: dict[str, Any] = raw_config if isinstance(raw_config, dict) else {}
+        self.config: dict[str, Any] = config if isinstance(config, dict) else {}
 
         admin_uins = self.config.get("admin_uins", [])
         if isinstance(admin_uins, str):
@@ -83,15 +85,26 @@ class QQZoneRandomPlugin(Star):
         self._login_uin: int = 0
         self._http: aiohttp.ClientSession | None = None
 
+        self._schedule_task: asyncio.Task | None = None
+        self._posted_today: int = 0
+        self._last_post_date: str = ""
+        self._next_times: list[float] = []
+        self._load_schedule_config()
+
         self._load_state()
-        logger.info("QQ空间插件已加载 admin_uins=%s", self.admin_uins)
+        logger.info("QQ空间插件已加载 admin_uins=%s schedule=%s",
+                     self.admin_uins, self._schedule_enabled)
 
     async def initialize(self):
         self._capture_onebot_client_from_context()
         self._http = aiohttp.ClientSession()
+        if self._schedule_enabled and self._cookie_bound:
+            self._start_scheduler()
 
     async def terminate(self):
         self._save_state()
+        if self._schedule_task:
+            self._schedule_task.cancel()
         if self._http:
             await self._http.close()
             self._http = None
@@ -375,6 +388,214 @@ class QQZoneRandomPlugin(Star):
             pass
         return None
 
+    def _format_next_times(self) -> str:
+        """Format next scheduled post times for display."""
+        if not self._schedule_enabled:
+            return "Next: scheduler disabled"
+        if not self._next_times:
+            # estimate: if scheduler is running, compute what it would pick
+            remaining = max(0, self._schedule_max - self._posted_today)
+            if remaining <= 0:
+                tomorrow = datetime.now().date() + timedelta(days=1)
+                return f"Next: tomorrow at {self._schedule_start}:00+ (daily limit reached)"
+            count = min(remaining, self._schedule_max)
+            estimated = self._random_times_today(max(count, self._schedule_min))
+            if estimated:
+                self._next_times = estimated
+            else:
+                return "Next: out of today's time window"
+
+        now = datetime.now().timestamp()
+        future = [t for t in self._next_times if t > now]
+        if not future:
+            tomorrow = datetime.now().date() + timedelta(days=1)
+            return f"Next: tomorrow at {self._schedule_start}:00+"
+        times_str = ", ".join(
+            datetime.fromtimestamp(t).strftime("%H:%M") for t in future[:10]
+        )
+        countdown = int(future[0] - now)
+        h, m = divmod(countdown, 3600)
+        m //= 60
+        return f"Next ({len(future)} posts, min 30min gap): {times_str}\nFirst in: {h}h {m}m"
+
+    def _load_schedule_config(self) -> None:
+        """Load schedule config from AstrBotConfig (auto-updated from _conf_schema)."""
+        schedule_cfg = self.config.get("schedule", {})
+        if isinstance(schedule_cfg, dict):
+            self._schedule_enabled = bool(schedule_cfg.get("enabled", False))
+            self._schedule_start = int(schedule_cfg.get("start_hour", 9))
+            self._schedule_end = int(schedule_cfg.get("end_hour", 22))
+            self._schedule_min = max(0, int(schedule_cfg.get("min_posts", 0)))
+            self._schedule_max = max(self._schedule_min, int(schedule_cfg.get("max_posts", 3)))
+        else:
+            self._schedule_enabled = False
+            self._schedule_start = 9
+            self._schedule_end = 22
+            self._schedule_min = 0
+            self._schedule_max = 3
+
+    # -- scheduler --
+
+    def _start_scheduler(self) -> None:
+        if self._schedule_task and not self._schedule_task.done():
+            return
+        if not self._schedule_enabled or self._schedule_max <= 0:
+            return
+        self._schedule_task = asyncio.create_task(self._schedule_loop())
+        logger.info("QQ空间: scheduler started %d-%dh, %d-%d posts/day",
+                     self._schedule_start, self._schedule_end,
+                     self._schedule_min, self._schedule_max)
+
+    def _random_times_today(self, count: int) -> list[float]:
+        """Generate `count` random timestamps within schedule range, each >=30min apart.
+        If window is too small, reduces count or returns empty list."""
+        _MIN_GAP = 1800  # 30 minutes
+        now = datetime.now()
+        end_dt = now.replace(hour=self._schedule_end, minute=0, second=0)
+        now_s = now.timestamp()
+        end_s = end_dt.timestamp()
+        window = max(end_s - now_s - 60, 0)
+        if window <= 0:
+            return []
+        # check if we can fit the requested count with minimum gap
+        needed = (count - 1) * _MIN_GAP + 60
+        if window < needed:
+            count = max(1, int(window // _MIN_GAP) + 1)
+            if count <= 0:
+                return []
+        times: list[float] = []
+        for i in range(count):
+            min_t = now_s + 60 + i * _MIN_GAP
+            max_t = end_s - (count - 1 - i) * _MIN_GAP
+            if max_t <= min_t:
+                break
+            t = random.uniform(min_t, max_t)
+            times.append(t)
+        times.sort()
+        return times
+
+    async def _schedule_loop(self) -> None:
+        """Main scheduler loop. Runs once per day, picks random times, then sleeps & posts."""
+        while True:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if today != self._last_post_date:
+                self._posted_today = 0
+                self._last_post_date = today
+
+            remaining = max(0, self._schedule_max - self._posted_today)
+            if remaining <= 0:
+                # wait until next day
+                tomorrow = datetime.now().date() + timedelta(days=1)
+                next_start = datetime.combine(tomorrow, datetime.min.time()).replace(hour=self._schedule_start)
+                delay = (next_start - datetime.now()).total_seconds()
+                if delay > 0:
+                    logger.info("QQ空间: scheduler sleeping %.0fs until next day", delay)
+                    await asyncio.sleep(delay)
+                continue
+
+            count = random.randint(self._schedule_min, min(remaining, self._schedule_max))
+            if count <= 0:
+                await asyncio.sleep(600)  # 10 min retry
+                continue
+
+            times = self._random_times_today(count)
+            self._next_times = times
+            if not times:
+                logger.info("QQ空间: scheduler skipped, time window too small for %d posts (min 30min gap)", count)
+                # wait for next day
+                tomorrow = datetime.now().date() + timedelta(days=1)
+                next_start = datetime.combine(tomorrow, datetime.min.time()).replace(hour=self._schedule_start)
+                delay = (next_start - datetime.now()).total_seconds()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                continue
+            logger.info("QQ空间: scheduler will post %d times today at %s",
+                         len(times), [datetime.fromtimestamp(t).strftime("%H:%M") for t in times])
+
+            for target_ts in times:
+                delay = target_ts - datetime.now().timestamp()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if not self._cookie_bound:
+                    logger.warning("QQ空间: scheduler skipped, cookie not bound")
+                    continue
+                try:
+                    await self._scheduled_post()
+                except Exception as exc:
+                    logger.warning("QQ空间: scheduled post failed: %s", exc)
+
+            # wait for next day
+            tomorrow = datetime.now().date() + timedelta(days=1)
+            next_start = datetime.combine(tomorrow, datetime.min.time()).replace(hour=self._schedule_start)
+            delay = (next_start - datetime.now()).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    async def _scheduled_post(self) -> None:
+        """Generate and publish one scheduled post."""
+        # Get chat history from first available source
+        history = ""
+        try:
+            context: Any = getattr(self, "_context", None)
+            if context:
+                conv_mgr: Any = getattr(context, "conversation_manager", None)
+                if conv_mgr:
+                    # get first conversation
+                    convs = await conv_mgr.get_conversations()
+                    if convs:
+                        conv = convs[0]
+                        history_raw: Any = getattr(conv, "history", None)
+                        if history_raw and isinstance(history_raw, str):
+                            messages: Any = json.loads(history_raw)
+                            if isinstance(messages, list):
+                                lines: list[str] = []
+                                for msg in messages[-50:]:
+                                    if isinstance(msg, dict):
+                                        role = msg.get("role", "")
+                                        content = str(msg.get("content", ""))[:200]
+                                        d = "user" if role == "user" else ("AI" if role == "assistant" else role)
+                                        lines.append(f"[{d}]: {content}")
+                                history = "\n".join(lines)
+        except Exception:
+            pass
+
+        if not history:
+            logger.warning("QQ空间: scheduler no history, using fallback")
+            text = "今天也是元气满满的一天！"
+        else:
+            prompt = (
+                f"现在是 {datetime.now().strftime('%Y-%m-%d %H:%M')}。\n"
+                "你是一个有自己性格的QQ空间用户。以下是最近聊天记录。\n"
+                "根据当前时间和聊天内容，以你自己的口吻和性格写一段日常说说。\n"
+                "内容要符合时间段语境（如: 早晨/午间/傍晚/深夜），简短有个性，只输出正文。\n\n"
+                f"聊天记录:\n{history[:4000]}"
+            )
+            # reuse event-less LLM call
+            event = self._scheduled_event()
+            text = await self._llm_generate(event, prompt) or "今天也是元气满满的一天！"
+
+        if not text.strip():
+            text = "今天也是元气满满的一天！"
+
+        logger.info("QQ空间: scheduled post text=%s...", text[:50])
+        result = await self._publish_to_qzone(text)
+        if isinstance(result, dict) and result.get("code", result.get("ret", -1)) == 0:
+            self._posted_today += 1
+            logger.info("QQ空间: scheduled post #%d published", self._posted_today)
+        else:
+            msg = result.get("message", result.get("msg", "")) if isinstance(result, dict) else str(result)
+            logger.warning("QQ空间: scheduled post failed: %s", msg)
+
+    def _scheduled_event(self) -> Any:
+        """Create a minimal fake event for LLM calls without a real event."""
+        class _FakeEvent:
+            def __init__(self):
+                self.message_str = ""
+                self.unified_msg_origin = ""
+            def get_sender_id(self) -> str: return "0"
+            def get_sender_name(self) -> str: return "scheduler"
+        return _FakeEvent()
+
     # -- commands --
 
     @filter.command_group("qzone")
@@ -486,15 +707,64 @@ class QQZoneRandomPlugin(Star):
     @qzone.command("help")
     async def cmd_help(self, event: AstrMessageEvent):
         yield self._command_result(event,
-            "/qzone status   - check status\n"
-            "/qzone autobind - auto bind cookie\n"
-            "/qzone bind     - manual bind cookie\n"
-            "/qzone unbind   - unbind cookie\n"
-            "/qzone post     - publish post\n"
-            "/qzone generate  - AI generate from chat\n"
-            "/qzone autopost   - AI generate & publish\n"
-            "/qzone help     - this help"
+            "/qzone status    - check status\n"
+            "/qzone autobind  - auto bind cookie\n"
+            "/qzone bind      - manual bind cookie\n"
+            "/qzone unbind    - unbind cookie\n"
+            "/qzone post      - publish post\n"
+            "/qzone generate   - AI generate from chat\n"
+            "/qzone autopost    - AI generate & publish\n"
+            "/qzone schedule   - show/start/stop scheduler\n"
+            "/qzone next       - show next post times\n"
+            "/qzone help      - this help"
         )
+
+    @qzone.command("schedule")
+    async def cmd_schedule(self, event: AstrMessageEvent):
+        """Manage scheduler. Usage: /qzone schedule [start|stop|status]"""
+        if not self._is_admin(event):
+            yield self._command_result(event, "Admin only.")
+            return
+
+        msg = event.message_str.strip()
+        parts = msg.split()
+        sub = parts[2] if len(parts) > 2 else "status"
+
+        next_info = self._format_next_times()
+
+        if sub == "start":
+            self._load_schedule_config()
+            self._start_scheduler()
+            yield self._command_result(event,
+                f"Scheduler started.\n"
+                f"Time: {self._schedule_start}:00 - {self._schedule_end}:00\n"
+                f"Posts: {self._schedule_min}-{self._schedule_max} per day\n"
+                f"{next_info}"
+            )
+        elif sub == "stop":
+            self._schedule_enabled = False
+            if self._schedule_task:
+                self._schedule_task.cancel()
+                self._schedule_task = None
+            self._next_times = []
+            yield self._command_result(event, "Scheduler stopped.")
+        else:
+            self._load_schedule_config()
+            status_text = "running" if (self._schedule_task and not self._schedule_task.done()) else "stopped"
+            yield self._command_result(event,
+                f"Scheduler: {status_text}\n"
+                f"Time: {self._schedule_start}:00 - {self._schedule_end}:00\n"
+                f"Posts: {self._schedule_min}-{self._schedule_max}/day\n"
+                f"Today: {self._posted_today} posted\n"
+                f"Enabled: {self._schedule_enabled}\n"
+                f"{next_info}"
+            )
+
+    @qzone.command("next")
+    async def cmd_next(self, event: AstrMessageEvent):
+        """Show next scheduled post times."""
+        self._load_schedule_config()
+        yield self._command_result(event, self._format_next_times())
 
     # -- LLM generation --
 
@@ -615,13 +885,17 @@ class QQZoneRandomPlugin(Star):
             yield self._command_result(event, "No chat history yet. Chat first, then retry.")
             return
         prompt = (
-            "Based on the following recent chat history, write a short QQ Zone post.\n"
-            "Requirements: short, personal, like a real daily update.\n"
-            "Match the tone and personality from the chat.\n"
-            "Only output the final post text, no explanation.\n\n"
-            f"Recent chat:\n{history[:4000]}"
+            f"现在是 {datetime.now().strftime('%Y-%m-%d %H:%M')}。\n"
+            "你是一个有自己性格的QQ空间用户。以下是你最近和朋友的聊天记录。\n"
+            "请根据当前时间和聊天内容，以你自己的口吻和性格，\n"
+            "写一段适合发到QQ空间的日常说说。\n"
+            "要求: 内容符合时间段语境，简短有个性，只输出正文。\n\n"
+            f"最近聊天记录:\n{history[:4000]}"
         )
-        sp = "You are a QQ Zone user. Write a daily post based on chat context. Output only the post text."
+        sp = (
+            "你是一个有性格的QQ空间用户。请延续你在聊天记录中展现的人设和口吻，"
+            "写一段日常说说。只输出正文。"
+        )
         yield event.plain_result("Generating...")
         text = await self._llm_generate(event, prompt, sp)
         if not text:
@@ -645,12 +919,15 @@ class QQZoneRandomPlugin(Star):
             yield self._command_result(event, "No chat history yet.")
             return
         prompt = (
-            "Based on the following recent chat history, write a short QQ Zone post.\n"
-            "Requirements: short, personal, like a real daily update.\n"
-            "Only output the final post text, no explanation.\n\n"
-            f"Chat:\n{history[:4000]}"
+            f"现在是 {datetime.now().strftime('%Y-%m-%d %H:%M')}。\n"
+            "你是一个有自己性格的QQ空间用户。以下是最近聊天记录。\n"
+            "根据当前时间和聊天内容，以你自己的口吻写一段日常说说。\n"
+            "内容符合时间段语境，简短有个性，只输出正文。\n\n"
+            f"聊天记录:\n{history[:4000]}"
         )
-        sp = "You are a QQ Zone user. Output only the post text."
+        sp = (
+            "你是一个有性格的QQ空间用户。延续聊天中人设写日常说说。只输出正文。"
+        )
         yield event.plain_result("Generating & publishing...")
         text = await self._llm_generate(event, prompt, sp)
         if not text:
