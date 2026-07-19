@@ -598,11 +598,11 @@ class QQZoneRandomPlugin(Star):
 
     # -- commands --
 
-    @filter.command_group("qzone")
-    def qzone(self):
+    @filter.command_group("qz")
+    def qz(self):
         pass
 
-    @qzone.command("status")
+    @qz.command("status")
     async def cmd_status(self, event: AstrMessageEvent):
         call_action = self._get_call_action(event)
         lines = ["QQ空间插件状态"]
@@ -618,7 +618,7 @@ class QQZoneRandomPlugin(Star):
             lines.append(f"p_skey: {'OK ' + p_skey[:8] + '...' if p_skey else 'MISSING'}")
         yield self._command_result(event, "\n".join(lines))
 
-    @qzone.command("autobind")
+    @qz.command("autobind")
     async def cmd_autobind(self, event: AstrMessageEvent):
         if not self._is_admin(event):
             yield self._command_result(event, "Admin only.")
@@ -633,10 +633,10 @@ class QQZoneRandomPlugin(Star):
         else:
             yield self._command_result(event,
                 "Auto-bind failed. Ensure OneBot supports get_cookies.\n"
-                "Or manual: /qzone bind p_skey=xxx; uin=xxx"
+                "Or manual: /qz bind p_skey=xxx; uin=xxx"
             )
 
-    @qzone.command("bind")
+    @qz.command("bind")
     async def cmd_bind(self, event: AstrMessageEvent):
         if not self._is_admin(event):
             yield self._command_result(event, "Admin only.")
@@ -644,7 +644,7 @@ class QQZoneRandomPlugin(Star):
         message_str = event.message_str.strip()
         parts = message_str.split(None, 2)
         if len(parts) < 3:
-            yield self._command_result(event, "Usage: /qzone bind p_skey=xxx; uin=xxx")
+            yield self._command_result(event, "Usage: /qz bind p_skey=xxx; uin=xxx")
             return
         cookie_str = parts[-1].strip()
         cookies = self._parse_cookie_string(cookie_str)
@@ -661,7 +661,7 @@ class QQZoneRandomPlugin(Star):
         self._save_state()
         yield self._command_result(event, f"Cookie bound! Account: {self._login_uin}")
 
-    @qzone.command("unbind")
+    @qz.command("unbind")
     async def cmd_unbind(self, event: AstrMessageEvent):
         if not self._is_admin(event):
             yield self._command_result(event, "Admin only.")
@@ -672,21 +672,21 @@ class QQZoneRandomPlugin(Star):
         self._save_state()
         yield self._command_result(event, "Cookie unbound.")
 
-    @qzone.command("post")
+    @qz.command("post")
     async def cmd_post(self, event: AstrMessageEvent):
         if not self._is_admin(event):
             yield self._command_result(event, "Admin only.")
             return
         if not self._cookie_bound:
-            yield self._command_result(event, "Cookie not bound. Run /qzone autobind first.")
+            yield self._command_result(event, "Cookie not bound. Run /qz autobind first.")
             return
         message_str = event.message_str.strip()
-        for prefix in ("/qzone post", "/qzone post "):
+        for prefix in ("/qz post", "/qz post "):
             if message_str.startswith(prefix):
                 message_str = message_str[len(prefix):].strip()
                 break
         if not message_str:
-            yield self._command_result(event, "Usage: /qzone post <content>")
+            yield self._command_result(event, "Usage: /qz post <content>")
             return
         images = self._get_images_from_event(event)
         image_hint = f" (+{len(images)} images)" if images else ""
@@ -704,24 +704,24 @@ class QQZoneRandomPlugin(Star):
         else:
             yield self._command_result(event, f"Unknown response: {str(result)[:300]}")
 
-    @qzone.command("help")
+    @qz.command("help")
     async def cmd_help(self, event: AstrMessageEvent):
         yield self._command_result(event,
-            "/qzone status    - check status\n"
-            "/qzone autobind  - auto bind cookie\n"
-            "/qzone bind      - manual bind cookie\n"
-            "/qzone unbind    - unbind cookie\n"
-            "/qzone post      - publish post\n"
-            "/qzone generate   - AI generate from chat\n"
-            "/qzone autopost    - AI generate & publish\n"
-            "/qzone schedule   - show/start/stop scheduler\n"
-            "/qzone next       - show next post times\n"
-            "/qzone help      - this help"
+            "/qz status    - check status\n"
+            "/qz autobind  - auto bind cookie\n"
+            "/qz bind      - manual bind cookie\n"
+            "/qz unbind    - unbind cookie\n"
+            "/qz post      - publish post\n"
+            "/qz generate   - AI generate from chat\n"
+            "/qz autopost    - AI generate & publish\n"
+            "/qz schedule   - show/start/stop scheduler\n"
+            "/qz next       - show next post times\n"
+            "/qz help      - this help"
         )
 
-    @qzone.command("schedule")
+    @qz.command("schedule")
     async def cmd_schedule(self, event: AstrMessageEvent):
-        """Manage scheduler. Usage: /qzone schedule [start|stop|status]"""
+        """Manage scheduler. Usage: /qz schedule [start|stop|status]"""
         if not self._is_admin(event):
             yield self._command_result(event, "Admin only.")
             return
@@ -760,7 +760,7 @@ class QQZoneRandomPlugin(Star):
                 f"{next_info}"
             )
 
-    @qzone.command("next")
+    @qz.command("next")
     async def cmd_next(self, event: AstrMessageEvent):
         """Show next scheduled post times."""
         self._load_schedule_config()
@@ -875,7 +875,7 @@ class QQZoneRandomPlugin(Star):
                     return val.strip()
         return ""
 
-    @qzone.command("generate")
+    @qz.command("generate")
     async def cmd_generate(self, event: AstrMessageEvent):
         if not self._is_admin(event):
             yield self._command_result(event, "Admin only.")
@@ -903,16 +903,16 @@ class QQZoneRandomPlugin(Star):
             return
         yield self._command_result(event,
             f"Generated:\n---\n{text}\n---\n"
-            f"Use /qzone autopost to publish directly."
+            f"Use /qz autopost to publish directly."
         )
 
-    @qzone.command("autopost")
+    @qz.command("autopost")
     async def cmd_autopost(self, event: AstrMessageEvent):
         if not self._is_admin(event):
             yield self._command_result(event, "Admin only.")
             return
         if not self._cookie_bound:
-            yield self._command_result(event, "Cookie not bound. /qzone autobind first.")
+            yield self._command_result(event, "Cookie not bound. /qz autobind first.")
             return
         history = await self._chat_history_context(event)
         if not history:
